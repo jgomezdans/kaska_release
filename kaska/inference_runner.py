@@ -17,10 +17,9 @@ import numpy as np
 
 from osgeo import gdal
 
-from .utils import get_chunks
+from .utils import get_chunks, define_temporal_grid
 from .s2_observations import Sentinel2Observations
 from .kaska import KaSKA
-from .kaska import define_temporal_grid
 
 Config = namedtuple(
     "Config", "s2_obs temporal_grid state_mask inverter output_folder"
@@ -36,11 +35,11 @@ def stitch_outputs(output_folder, parameter_list):
     reasonably created by e.g. `process_tile` below. It is not a problem to
     have missing tiles that weren't processed (this sometimes happens if
     the state mask shows no useable pixels). We assume the relevant files
-    have the following filename structure 
-    `[parameter]_A[year][DoY]_0x[tile].tif`, where `parameter` is the 
+    have the following filename structure
+    `[parameter]_A[year][DoY]_0x[tile].tif`, where `parameter` is the
     parameter name, `year` is e.g. `2019` `DoY` is day of year and tile
     is a hexadecimal number with the tile number.
-    
+
     Parameters
     ----------
     output_folder : str
@@ -48,7 +47,7 @@ def stitch_outputs(output_folder, parameter_list):
     parameter_list : list
         A list of parameters. This is used to search individual tiles by
         filename (e.g. `LAI_A2019135_0xfd.tif`).
-    
+
     Returns
     -------
     list
@@ -123,6 +122,9 @@ def stitch_outputs(output_folder, parameter_list):
             ],
         )
         shutil.move(p / "temporary.tif", (p / f"{parameter:s}.tif").as_posix())
+        # Remove unneeded leftover files
+        vrts = [f.unlink() for f in p.glob("*.vrt")]
+        ovr = [f.unlink() for f in p.glob("*.ovr")]
 
         LOG.info(f"Saved {parameter:s} file as {output_tiffs[parameter]:s}")
     return output_tiffs
@@ -131,7 +133,7 @@ def stitch_outputs(output_folder, parameter_list):
 def process_tile(the_chunk, config):
     """A function to process a single spatial tile. The function
     receives a `chunk` object, and a configuration object.
-    
+
     Parameters
     ----------
     the_chunk : iter
@@ -140,7 +142,7 @@ def process_tile(the_chunk, config):
         tile number.
     config : Config
         A configuration object.
-    
+
     Returns
     -------
     list
@@ -158,19 +160,28 @@ def process_tile(the_chunk, config):
     # Apply the region of interest to the observations
     s2_obs = copy.copy(config.s2_obs)
     s2_obs.apply_roi(ulx, uly, lrx, lry)
-
-    # Define KaSKA object with windowed observations.
-    kaska = KaSKA(
-        s2_obs,
-        config.temporal_grid,
-        config.state_mask,
-        config.inverter,
-        config.output_folder,
-        chunk=hex(chunk_no),
-    )
-    parameter_names, parameter_data = kaska.run_retrieval()
-    kaska.save_s2_output(parameter_names, parameter_data)
-    return parameter_names
+    chunk_mask = s2_obs.state_mask.ReadAsArray()
+    n_unmasked_pxls = np.sum(chunk_mask)
+    
+    
+    if n_unmasked_pxls == 0:
+        LOG.info(f"No pixels in chunk {hex(chunk_no):s}")
+        return None
+    else:
+        # Define KaSKA object with windowed observations.
+        
+        LOG.info(f"Unmasked pixels in {hex(chunk_no):s}: {n_unmasked_pxls:d}")
+        kaska = KaSKA(
+            s2_obs,
+            config.temporal_grid,
+            config.state_mask,
+            config.inverter,
+            config.output_folder,
+            chunk=hex(chunk_no),
+        )
+        parameter_names, parameter_data = kaska.run_retrieval()
+        kaska.save_s2_output(parameter_names, parameter_data)
+        return parameter_names
 
 
 def kaska_runner(
@@ -183,11 +194,12 @@ def kaska_runner(
     s2_emulator,
     output_folder,
     dask_client=None,
+    block_size= [256, 256],
+    chunk=None
 ):
     """Runs a KaSKA problem for S2 producing parameter estimates between
     `start_date` and `end_date` with a temporal spacing `temporal_grid_space`.
-    
-    
+
     Parameters
     ----------
     start_date : datetime object
@@ -209,9 +221,14 @@ def kaska_runner(
         A folder where the output files will be dumped.
     dask_client : dask, optional
         Allows the distribution of the processing using a dask distributed
-        cluster. If this is None, then the processing is run tiled but 
+        cluster. If this is None, then the processing is run tiled but
         sequentially.
-    
+    block_size : int list[2], optional
+        The size of the tile to break the image into (in pixels).
+    chunk: int, optional
+        The chunk number to run the processing for. Doesn't loop over all
+        chunks, just runs one chunk. By default, set to `None`.
+
     Returns
     -------
     list
@@ -237,17 +254,32 @@ def kaska_runner(
     # Avoid reading mask in memory in case we fill it up
     g = gdal.Open(state_mask)
     ny, nx = g.RasterYSize, g.RasterXSize
+    if chunk is None:
+        # Do the splitting
+        them_chunks = [the_chunk for the_chunk in get_chunks(
+            nx, ny, block_size=block_size)]
 
-    # Do the splitting
-    them_chunks = (the_chunk for the_chunk in get_chunks(nx, ny))
+        wrapper = partial(process_tile, config=config)
+        if dask_client is None:
+            retval = list(map(wrapper, them_chunks))
+        else:
+            A = dask_client.map(wrapper, them_chunks)
+            retval = dask_client.gather(A)
 
-    wrapper = partial(process_tile, config=config)
-    if dask_client is None:
-        retval = list(map(wrapper, them_chunks))
+        try:
+            parameter_names = next(item for item in retval if item is not None)
+        except StopIteration:
+            LOG.info("No masked pixels processed! Sure mask was sensible?")
+            return []
+        LOG.info("Starting file stitching")
+        return stitch_outputs(output_folder, parameter_names)
     else:
-        A = dask_client.map(wrapper, them_chunks)
-        retval = dask_client.gather(A)
-
-    parameter_names = retval[0]
-
-    return stitch_outputs(output_folder, parameter_names)
+        # Do the splitting
+        LOG.info(f"Doing chunk {chunk:d}")
+        the_chunk = [the_chunk 
+                     for the_chunk in get_chunks(
+                        nx, ny, block_size=block_size) 
+                     if the_chunk[-1] == chunk]
+        LOG.info("Single chunk!")
+        wrapper(the_chunk[0])
+        return None
